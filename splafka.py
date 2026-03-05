@@ -3,10 +3,10 @@
 
 import argparse
 import json
+import os
 import signal
 import sys
 import uuid
-from datetime import datetime, timezone
 
 from confluent_kafka import Consumer, KafkaError, KafkaException
 
@@ -21,45 +21,20 @@ def build_consumer(bootstrap_servers: str, group_id: str, from_beginning: bool) 
     return Consumer(config)
 
 
-def serialize_message(msg) -> dict:
-    key = msg.key()
-    value = msg.value()
-    return {
-        "topic": msg.topic(),
-        "partition": msg.partition(),
-        "offset": msg.offset(),
-        "timestamp": msg.timestamp()[1],
-        "key": key.decode("utf-8", errors="replace") if key else None,
-        "value": value.decode("utf-8", errors="replace") if value else None,
-        "received_at": datetime.now(timezone.utc).isoformat(),
-    }
+def enrich_message(msg) -> dict:
+    """Parse the message value as JSON and inject Kafka metadata fields."""
+    raw = msg.value()
+    text = raw.decode("utf-8", errors="replace") if raw else "{}"
+    try:
+        record = json.loads(text)
+    except json.JSONDecodeError:
+        record = {"_raw_value": text}
+        print(f"Warning: non-JSON message at {msg.topic()}:{msg.partition()}@{msg.offset()}", file=sys.stderr)
 
-
-def consume_loop(consumer: Consumer, output_path: str, quiet: bool):
-    count = 0
-    with open(output_path, "a") as f:
-        while True:
-            msg = consumer.poll(timeout=1.0)
-            if msg is None:
-                continue
-            if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
-                    continue
-                raise KafkaException(msg.error())
-
-            record = serialize_message(msg)
-            f.write(json.dumps(record) + "\n")
-            f.flush()
-            count += 1
-
-            if not quiet:
-                print(
-                    f"[{record['received_at']}] "
-                    f"{record['topic']}:{record['partition']}@{record['offset']}  "
-                    f"{(record['value'] or '')[:120]}",
-                    file=sys.stderr,
-                )
-    return count
+    record["topic"] = msg.topic()
+    record["partition"] = msg.partition()
+    record["offset"] = msg.offset()
+    return record
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -80,8 +55,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "-o", "--output",
-        default="output.jsonl",
-        help="Output file path (default: output.jsonl). Messages are appended as JSONL.",
+        default="output.json",
+        help="Output filename (default: output.json).",
+    )
+    parser.add_argument(
+        "-d", "--output-dir",
+        default=".",
+        help="Directory for the output file (default: current directory). Created if it doesn't exist.",
     )
     parser.add_argument(
         "-g", "--group-id",
@@ -106,6 +86,9 @@ def parse_args(argv=None) -> argparse.Namespace:
 def main(argv=None):
     args = parse_args(argv)
 
+    os.makedirs(args.output_dir, exist_ok=True)
+    output_path = os.path.join(args.output_dir, args.output)
+
     group_id = args.group_id or f"splafka-{uuid.uuid4().hex[:8]}"
     consumer = build_consumer(args.bootstrap_servers, group_id, args.from_beginning)
 
@@ -120,7 +103,7 @@ def main(argv=None):
 
     print(f"Connecting to {args.bootstrap_servers}", file=sys.stderr)
     print(f"Subscribing to topics: {', '.join(args.topics)}", file=sys.stderr)
-    print(f"Writing to {args.output}", file=sys.stderr)
+    print(f"Writing to {output_path}", file=sys.stderr)
     print(f"Consumer group: {group_id}", file=sys.stderr)
     print("Press Ctrl+C to stop.\n", file=sys.stderr)
 
@@ -128,7 +111,7 @@ def main(argv=None):
 
     count = 0
     try:
-        with open(args.output, "a") as f:
+        with open(output_path, "a") as f:
             while not shutdown:
                 msg = consumer.poll(timeout=1.0)
                 if msg is None:
@@ -138,16 +121,15 @@ def main(argv=None):
                         continue
                     raise KafkaException(msg.error())
 
-                record = serialize_message(msg)
+                record = enrich_message(msg)
                 f.write(json.dumps(record) + "\n")
                 f.flush()
                 count += 1
 
                 if not args.quiet:
+                    preview = json.dumps(record, separators=(",", ":"))[:120]
                     print(
-                        f"[{record['received_at']}] "
-                        f"{record['topic']}:{record['partition']}@{record['offset']}  "
-                        f"{(record['value'] or '')[:120]}",
+                        f"{record['topic']}:{record['partition']}@{record['offset']}  {preview}",
                         file=sys.stderr,
                     )
     except KafkaException as e:
@@ -155,7 +137,7 @@ def main(argv=None):
         sys.exit(1)
     finally:
         consumer.close()
-        print(f"\nConsumed {count} message(s). Output written to {args.output}", file=sys.stderr)
+        print(f"\nConsumed {count} message(s). Output written to {output_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":

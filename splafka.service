@@ -1,0 +1,35 @@
+[Unit]
+Description=splafka - Kafka topic consumer writing to local JSONL
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=splafka
+Group=splafka
+
+# Adjust these paths to match your deployment
+WorkingDirectory=/opt/splafka
+ExecStart=/opt/splafka/venv/bin/python /opt/splafka/splafka.py \
+    -b 198.18.201.39:30092 \
+    -t topic-1 topic-2 \
+    -d /var/lib/splafka \
+    -o output.json \
+    -g splafka-daemon \
+    -q
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=splafka
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/splafka
+
+[Install]
+WantedBy=multi-user.target
